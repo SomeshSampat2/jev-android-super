@@ -1,0 +1,4 @@
+<resources>
+    <string name="app_name">Jev Android Super</string>
+    <string name="service_description">Lets Jev Android Super read the screen and perform taps, typing, scrolling and navigation so it can carry out tasks you describe.</string>
+</resources>
