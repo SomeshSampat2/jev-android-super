@@ -14,6 +14,10 @@ tap in a fraction of a second, and keeps going until the job is done.
 
 ### [⬇ Download the APK — jev-android-super.apk](https://github.com/SomeshSampat2/jev-android-super/releases/latest/download/jev-android-super.apk)
 
+<img src="assets/jev-android-super-demo.gif" alt="Jev Android Super demo — 'open YouTube and subscribe to MrBeast' completed autonomously" width="320"/>
+
+*Goal: "open YouTube and subscribe to MrBeast" — 17 steps, ~32 s, fully autonomous.*
+
 </div>
 
 ---
