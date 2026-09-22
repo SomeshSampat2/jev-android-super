@@ -42,6 +42,7 @@ class Screen(
     fun toState(
         goal: String,
         typedKeys: Set<String>,
+        typedIds: Set<String>,
         textToType: String?,
         pendingTexts: List<String>,
         recent: List<String>,
@@ -63,7 +64,10 @@ class Screen(
                     putJsonArray("at") { add(el.cx); add(el.cy) }
                     put("editable", el.editable)
                     put("focused", el.focused)
-                    put("typed", el.key in typedKeys)
+                    // Keys embed the field's text, so they change after typing —
+                // the stable view-id is the reliable "already typed" signal.
+                put("typed", el.key in typedKeys ||
+                    (el.id.isNotBlank() && el.id in typedIds))
                     putJsonArray("ops") { el.ops.forEach { add(it) } }
                 })
             }
