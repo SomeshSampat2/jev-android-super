@@ -106,6 +106,9 @@ data class GeminiGenConfig(
     // thinkingBudget 0 disables the reasoning pass on 2.5-flash-lite —
     // fastest possible latency for short structured outputs.
     val thinkingConfig: GeminiThinkingConfig? = null,
+    // JSON Schema for the response — requires responseMimeType
+    // "application/json" and replaces the deprecated responseSchema field.
+    val responseJsonSchema: JsonObject? = null,
 )
 
 @Serializable

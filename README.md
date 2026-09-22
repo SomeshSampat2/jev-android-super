@@ -53,6 +53,7 @@ This project splits the work:
 | Job | Who does it | Why |
 |-----|-------------|-----|
 | **Decisions** — *"what action, on which element?"* | **Jev** ([TypeSafe System One](https://typesafe.ai/blog/introducing-system-one-models-and-jev)) | Returns a typed judgment + probabilities in ~400 ms. No essays, no parsing fragile prose. |
+| **Launch** — *"which app does the goal need?"* | **Gemini 2.5 Flash-Lite** structured pick | One fuzzy goal→app match at run start — no hunting icons on the launcher. Falls back to the Play Store when the app isn't installed. |
 | **Words** — *"what text should go in this field?"* | **Gemini 2.5 Flash-Lite** → free [OpenRouter](https://openrouter.ai) models | Only called when free-form text is genuinely needed. Thinking disabled for lowest latency. |
 | **Hands** — *tap / type / scroll / back / home* | Android **AccessibilityService** | Deterministic execution, no flakiness. |
 | **Eyes** — *what is on screen right now?* | Accessibility node tree | Every interactive element is indexed with its label, bounds and state. |
@@ -88,6 +89,10 @@ flowchart LR
 
 ### Inside the agent loop
 
+0. **Launch** — Gemini picks the app the goal needs from the installed list
+   (one structured-output call) and the app is opened directly by intent.
+   If the goal needs something not installed, the Play Store opens and Jev
+   drives the install flow. No Gemini key? The loop simply navigates itself.
 1. **Capture** — the accessibility service reads the live UI tree; every
    interactive element gets an index, label, type, bounds and state flags
    (`editable`, `scrollable`, `typed`, …).
@@ -102,9 +107,12 @@ flowchart LR
    when Jev itself predicts progress loss, typed fields can't be re-typed,
    tap coordinates are re-resolved against the live screen.
 5. **Act** — deterministic `dispatchGesture` taps and `ACTION_SET_TEXT`.
-6. **Settle & repeat** — wait for the screen to stabilize, detect
-   "nothing changed", repeat-until-done. Loop detectors (repeats, cycles up to
-   period 8, screen revisits) stop runaway behavior with a clear reason.
+6. **Settle & repeat** — wait for the screen to stabilize (extra patience when
+   the node tree collapses mid-render), detect "nothing changed",
+   repeat-until-done. Loop detectors (repeats, cycles up to period 8, screen
+   revisits) stop runaway behavior — and per-screen **undo suppression**
+   removes taps proven to navigate backward, breaking A→B→A ping-pongs the
+   cycle detector can't see.
 
 ## Safety by design
 
@@ -126,7 +134,8 @@ flowchart LR
 2. **Add your keys** — open the app → *Settings*:
    - **TypeSafe API key** — required, powers Jev decisions
      ([typesafe.ai](https://typesafe.ai)).
-   - **Gemini API key** — recommended, powers fast text entry
+   - **Gemini API key** — recommended, powers fast text entry and the
+     run-start app pick
      ([aistudio.google.com/apikey](https://aistudio.google.com/apikey)).
    - **OpenRouter API key** — optional fallback for text
      ([openrouter.ai](https://openrouter.ai)).

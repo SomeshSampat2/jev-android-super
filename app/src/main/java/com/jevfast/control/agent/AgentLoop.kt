@@ -4,11 +4,13 @@ import android.accessibilityservice.AccessibilityService
 import android.content.Context
 import android.content.Intent
 import android.provider.Settings
+import com.jevfast.control.AppLauncher
 import com.jevfast.control.Keys
 import com.jevfast.control.a11y.CONTROL_APP_PKG
 import com.jevfast.control.a11y.ControlService
 import com.jevfast.control.a11y.El
 import com.jevfast.control.a11y.Screen
+import com.jevfast.control.net.AppPicker
 import com.jevfast.control.net.JevClient
 import com.jevfast.control.net.TextGenClient
 import kotlinx.coroutines.CancellationException
@@ -172,6 +174,16 @@ class AgentLoop(private val app: Context) {
         val queue = texts.toMutableList()
         val recent = mutableListOf<String>()
         val visits = mutableMapOf<Int, Int>()
+        // First-visit order per screen signature — an action landing on a
+        // screen first seen EARLIER is an undo (backward move); forward moves
+        // to already-seen screens stay legal.
+        val firstVisit = mutableMapOf<Int, Int>()
+        var visitSeq = 0
+        // Elements proven to undo the previous navigation, per screen
+        // signature — breaks A→B→A ping-pongs (search box reopens, suggestion
+        // re-taps) that the strict cycle detector can't see once other
+        // actions interleave.
+        val deadEnds = mutableMapOf<Int, MutableSet<String>>()
         // Repeat key is action + target key only — NOT the fingerprint, which
         // flaps constantly on live screens and would reset the count forever.
         var lastKey: Pair<String, String?>? = null
@@ -199,6 +211,19 @@ class AgentLoop(private val app: Context) {
 
         try {
             service.showControlIndicator()
+            say("goal: \"$goal\"" +
+                if (queue.isNotEmpty()) " (+${queue.size} text(s) queued)" else "",
+                countStep = false)
+
+            // Pre-flight launch: the installed-app space is far bigger than
+            // Jev's option limit and needs fuzzy matching, so Gemini picks
+            // once and Jev drives from inside the right app. If the goal's
+            // app isn't installed, open the Play Store and let Jev install it.
+            if (Keys.gemini(app).isNotBlank()) {
+                say("picking target app…", countStep = false)
+            }
+            launchTargetApp(service, recent)?.let { say(it, countStep = false) }
+
             while (stepN < MAX_STEPS) {
                 if (stopRequested) { _state.value = RunState.Idle; return }
 
@@ -228,8 +253,8 @@ class AgentLoop(private val app: Context) {
                 // action-cycle detector misses (e.g. drawer→search→type→home→drawer).
                 // A revisit means the previous approach failed: tell Jev, then
                 // hard-block after enough returns to the identical screen.
-                val visitSig = (screen.pkg + "|" +
-                    screen.elements.map { it.key }.sorted().joinToString("|")).hashCode()
+                val visitSig = screenSig(screen)
+                firstVisit.getOrPut(visitSig) { visitSeq++ }
                 val visitCount = (visits[visitSig] ?: 0) + 1
                 visits[visitSig] = visitCount
                 if (visitCount >= 6) {
@@ -253,7 +278,8 @@ class AgentLoop(private val app: Context) {
                     Keys.gemini(app).isNotBlank() || Keys.openRouter(app).isNotBlank()
                 val currentText = queue.firstOrNull()
                 val t0 = System.nanoTime()
-                val res = decide(screen, currentText, queue.drop(1), recent, canType, hint)
+                val res = decide(screen, currentText, queue.drop(1), recent, canType,
+                    hint, deadEnds[visitSig] ?: emptySet())
                 val decideMs = (System.nanoTime() - t0) / 1_000_000
                 tick()
 
@@ -373,6 +399,25 @@ class AgentLoop(private val app: Context) {
                 // change. Ratio thresholds lie in both directions; set equality
                 // only misses on noise, which just omits the annotation safely.
                 val post = service.screen()
+
+                // Undo detection: landing on a screen first seen earlier means
+                // this tap undid the previous navigation — suppress that
+                // element on this screen so the ping-pong can't repeat.
+                val postFirst = firstVisit[screenSig(post)]
+                if (postFirst != null && postFirst < (firstVisit[visitSig] ?: 0) &&
+                    res.action == "tap_element" && res.element != null) {
+                    deadEnds.getOrPut(visitSig) { mutableSetOf() } += res.element.key
+                    recent += "tapping '${res.element.shortName}' went back to " +
+                        "an earlier screen — avoid it here"
+                }
+
+                // Loading patience: a tree that collapsed to a skeleton is
+                // mid-render — give content a moment before deciding on it.
+                if (post.elements.size < 3 && screen.elements.size >= 3) {
+                    say("screen loading — waiting", countStep = false)
+                    delay(1200)
+                }
+
                 val unchanged = post.pkg == screen.pkg &&
                     post.elements.map { it.key }.toSet() ==
                     screen.elements.map { it.key }.toSet()
@@ -396,6 +441,53 @@ class AgentLoop(private val app: Context) {
             _state.value = RunState.Error(msg)
         } finally {
             service.hideControlIndicator()
+        }
+    }
+
+    /**
+     * One-time app launch before the loop: Gemini picks the app the goal needs
+     * from the installed list and we launch it directly. STORE seeds `recent`
+     * so Jev knows why it's in the Play Store (find + install, then continue).
+     * Null = picker unavailable or nothing to launch — the loop falls back to
+     * navigating on its own, exactly as before.
+     */
+    private suspend fun launchTargetApp(
+        service: ControlService,
+        recent: MutableList<String>,
+    ): String? {
+        val key = Keys.gemini(app)
+        if (key.isBlank()) return null
+        val apps = AppLauncher.installedApps(app)
+            .filter { it.packageName != CONTROL_APP_PKG }
+        if (apps.isEmpty()) return null
+        val appPick = try {
+            AppPicker.pick(key, goal, apps)
+        } catch (e: CancellationException) {
+            throw e
+        } catch (_: Exception) {
+            return null
+        } ?: return null
+        return when (appPick.pick) {
+            AppPicker.Pick.LAUNCH -> {
+                // Validate against the offered list — never launch a package
+                // the model hallucinated.
+                val pkg = appPick.packageName
+                    ?.takeIf { p -> apps.any { it.packageName == p } }
+                    ?: return null
+                // Already there — a launch intent would just bounce the task.
+                if (service.screen().pkg == pkg) return null
+                if (!AppLauncher.launch(app, pkg)) return null
+                delay(800)
+                "launched ${apps.first { it.packageName == pkg }.label} ($pkg)"
+            }
+            AppPicker.Pick.STORE -> {
+                if (!AppLauncher.launchPlayStore(app)) return null
+                delay(800)
+                recent += "goal needs an app that is not installed — Play " +
+                    "Store opened; search for and install it, then continue the goal"
+                "no installed app fits the goal — opened Play Store"
+            }
+            AppPicker.Pick.NONE -> null
         }
     }
 
@@ -426,9 +518,12 @@ class AgentLoop(private val app: Context) {
         recent: List<String>,
         canType: Boolean,
         hint: String?,
+        deadEnds: Set<String>,
     ): Decision {
         val elements = screen.elements.take(com.jevfast.control.a11y.MAX_ELEMENTS)
-        val tapOptions = elementOptions(elements)
+        // Dead ends stay out of the option space entirely — Jev can't pick
+        // what it can't see.
+        val tapOptions = elementOptions(elements.filter { it.key !in deadEnds })
         val typeOptions = elementOptions(elements.filter { it.editable })
 
         // Dynamic action space (jev-ultrafast): only offer operations the
@@ -495,7 +590,7 @@ class AgentLoop(private val app: Context) {
             }
         }
 
-        val state = screen.toState(goal, typed, textToType, pendingTexts, recent, hint)
+        val state = screen.toState(goal, typed, typedIds, textToType, pendingTexts, recent, hint)
         val res = JevClient.systemOne(Keys.typeSafe(app), Keys.jevModel(app), state, questions)
         val answers = res["answers"]?.jsonObject ?: JsonObject(emptyMap())
 
@@ -563,10 +658,16 @@ class AgentLoop(private val app: Context) {
                 append(" ${el.cls} at (${el.cx},${el.cy})")
                 if (el.editable) append(" editable")
                 if (el.focused) append(" focused")
+                if (el.key in typed || (el.id.isNotBlank() && el.id in typedIds))
+                    append(" (holds typed text — tapping reopens the editor)")
             }
         }
         return map
     }
+
+    /** Screen identity for visit/undo tracking — same keys as the fingerprint. */
+    private fun screenSig(s: Screen): Int =
+        (s.pkg + "|" + s.elements.map { it.key }.sorted().joinToString("|")).hashCode()
 
     // ---- execution ---------------------------------------------------------
 
